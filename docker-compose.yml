@@ -1,0 +1,40 @@
+version: '2.3'
+  
+services:
+  main:
+    container_name: SupContrast
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    runtime: nvidia
+    restart: always
+    env_file:
+      - "docker-compose-env/main.env"
+    volumes:
+      - type: volume
+        source: nfs_shared
+        target: /nfs_shared
+        volume:
+          nocopy: true
+      - "/media/ssd:/ssd"
+    expose:
+      - "8000"
+    ports:
+      - "29022:22"
+      - "29000:8000"
+    ipc: host
+    stdin_open: true
+    tty: true
+
+volumes:
+  dataset:
+    driver: local
+    driver_opts:
+      type: none
+      device: /media/ssd
+      o: bind
+  nfs_shared:
+    driver_opts:
+      type: "nfs"
+      o: "addr=mldisk2.sogang.ac.kr,nolock,soft,rw"
+      device: ":/volume1/nfs_shared"
