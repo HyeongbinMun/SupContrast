@@ -20,6 +20,8 @@ RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes #prohibit-p
 RUN pip3 install --upgrade pip
 RUN pip3 install setuptools
 
+RUN pip3 install torch==1.13.1+cu117 torchvision==0.14.1+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
+
 RUN apt-get update && apt-get install -y locales
 RUN locale-gen ko_KR.UTF-8
 ENV LC_ALL ko_KR.UTF-8

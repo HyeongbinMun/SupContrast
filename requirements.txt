@@ -1,0 +1,8 @@
+numpy
+scikit-learn
+matplotlib
+tensorboardX
+tqdm
+Pillow
+pyyaml
+wandb
