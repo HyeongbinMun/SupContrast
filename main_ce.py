@@ -5,10 +5,9 @@ import sys
 import argparse
 import time
 import math
-
-import tensorboard_logger as tb_logger
 import torch
 import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
 
 from util import AverageMeter
@@ -115,56 +114,102 @@ def parse_option():
     return opt
 
 
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import os
+import torch
+from collections import Counter
+
 def set_loader(opt):
-    # construct data loader
     if opt.dataset == 'cifar10':
         mean = (0.4914, 0.4822, 0.4465)
-        std = (0.2023, 0.1994, 0.2010)
+        std  = (0.2023, 0.1994, 0.2010)
     elif opt.dataset == 'cifar100':
         mean = (0.5071, 0.4867, 0.4408)
-        std = (0.2675, 0.2565, 0.2761)
+        std  = (0.2675, 0.2565, 0.2761)
+    elif opt.dataset == 'path':
+        if len(opt.mean) != 3 or len(opt.std) != 3:
+            raise ValueError("For custom dataset, provide --mean and --std with 3 values each.")
+        mean = tuple(opt.mean)
+        std  = tuple(opt.std)
     else:
-        raise ValueError('dataset not supported: {}'.format(opt.dataset))
+        raise ValueError(f'dataset not supported: {opt.dataset}')
+
     normalize = transforms.Normalize(mean=mean, std=std)
+    img_size = opt.img_size
 
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    # resize_blocks = [transforms.Resize((img_size, img_size))]
+    resize_blocks = [transforms.Resize(img_size), transforms.CenterCrop(img_size)]
 
-    val_transform = transforms.Compose([
-        transforms.ToTensor(),
-        normalize,
-    ])
+    train_transform = transforms.Compose(
+        resize_blocks + [
+            transforms.RandomHorizontalFlip(),
+            # transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+            # transforms.RandomGrayscale(p=0.2),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
 
+    val_transform = transforms.Compose(
+        resize_blocks + [
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+    # 3) dataset
     if opt.dataset == 'cifar10':
         train_dataset = datasets.CIFAR10(root=opt.data_folder,
                                          transform=train_transform,
                                          download=True)
-        val_dataset = datasets.CIFAR10(root=opt.data_folder,
-                                       train=False,
-                                       transform=val_transform)
+        val_dataset   = datasets.CIFAR10(root=opt.data_folder,
+                                         train=False,
+                                         transform=val_transform)
     elif opt.dataset == 'cifar100':
         train_dataset = datasets.CIFAR100(root=opt.data_folder,
                                           transform=train_transform,
                                           download=True)
-        val_dataset = datasets.CIFAR100(root=opt.data_folder,
-                                        train=False,
-                                        transform=val_transform)
-    else:
-        raise ValueError(opt.dataset)
+        val_dataset   = datasets.CIFAR100(root=opt.data_folder,
+                                          train=False,
+                                          transform=val_transform)
+    elif opt.dataset == 'path':
+        train_dir = os.path.join(opt.data_folder, 'train')
+        val_dir   = os.path.join(opt.data_folder, 'val')
+        train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
+        val_dataset   = datasets.ImageFolder(root=val_dir,   transform=val_transform)
+        opt.n_cls = len(train_dataset.classes)
 
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
-        num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=256, shuffle=False,
-        num_workers=8, pin_memory=True)
+        if train_dataset.class_to_idx != val_dataset.class_to_idx:
+            raise ValueError(
+                "class_to_idx mismatch between train and val.\n"
+                f"train classes: {sorted(train_dataset.class_to_idx.keys())}\n"
+                f"val   classes: {sorted(val_dataset.class_to_idx.keys())}\n"
+                "-> Class Error"
+            )
+
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=opt.batch_size,
+        shuffle=True,
+        num_workers=opt.num_workers,
+        pin_memory=pin,
+        persistent_workers=opt.num_workers > 0,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=opt.batch_size,
+        shuffle=False,
+        num_workers=opt.num_workers,
+        pin_memory=pin,
+        persistent_workers=opt.num_workers > 0,
+        drop_last=False,
+    )
 
     return train_loader, val_loader
+
 
 
 def set_model(opt):
@@ -290,9 +335,6 @@ def main():
     # build optimizer
     optimizer = set_optimizer(opt, model)
 
-    # tensorboard
-    logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
-
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
@@ -303,15 +345,8 @@ def main():
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
-        # tensorboard logger
-        logger.log_value('train_loss', loss, epoch)
-        logger.log_value('train_acc', train_acc, epoch)
-        logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
-
         # evaluation
         loss, val_acc = validate(val_loader, model, criterion, opt)
-        logger.log_value('val_loss', loss, epoch)
-        logger.log_value('val_acc', val_acc, epoch)
 
         if val_acc > best_acc:
             best_acc = val_acc

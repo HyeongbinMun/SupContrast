@@ -1,9 +1,13 @@
 from __future__ import print_function
 
+import os
 import sys
 import argparse
+import datetime
 import time
 import math
+import glob
+import wandb
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -28,19 +32,20 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=256,
+    parser.add_argument('--batch_size', type=int, default=124,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=4,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=100,
                         help='number of training epochs')
+    parser.add_argument('--img_size', type=int, default=256, help='image size (square)')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.1,
                         help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='60,75,90',
+    parser.add_argument('--lr_decay_epochs', type=str, default='30,60',
                         help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.2,
+    parser.add_argument('--lr_decay_rate', type=float, default=0.5,
                         help='decay rate for learning rate')
     parser.add_argument('--weight_decay', type=float, default=0,
                         help='weight decay')
@@ -50,7 +55,13 @@ def parse_option():
     # model dataset
     parser.add_argument('--model', type=str, default='resnet50')
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100'], help='dataset')
+                        choices=['cifar10', 'cifar100', 'path'], help='dataset')
+    parser.add_argument('--data_path', type=str, default='',
+                        help='path to custom dataset when dataset is "path"')
+    parser.add_argument('--mean', nargs='+', type=float, default=[0.5, 0.5, 0.5],
+                        help='mean for normalization')
+    parser.add_argument('--std', nargs='+', type=float, default=[0.5, 0.5, 0.5],
+                        help='std for normalization')
 
     # other setting
     parser.add_argument('--cosine', action='store_true',
@@ -61,10 +72,13 @@ def parse_option():
     parser.add_argument('--ckpt', type=str, default='',
                         help='path to pre-trained model')
 
-    opt = parser.parse_args()
+    parser.add_argument('--resume', type=str, default='',
+                        help='path to resume checkpoint (.pth). Use "auto" to pick latest in save dir')
 
-    # set the path according to the environment
-    opt.data_folder = './datasets/'
+    parser.add_argument('--wandb_resume', action='store_true',
+                        help='resume/append to the same wandb run (uses name as run id)')
+
+    opt = parser.parse_args()
 
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
@@ -92,13 +106,35 @@ def parse_option():
 
     if opt.dataset == 'cifar10':
         opt.n_cls = 10
+        opt.data_folder = './datasets/'
     elif opt.dataset == 'cifar100':
         opt.n_cls = 100
+        opt.data_folder = './datasets/'
+    elif opt.dataset == 'path':
+        if not opt.data_path:
+            raise ValueError('Custom dataset path must be specified with --data_path')
+        opt.data_folder = opt.data_path
     else:
         raise ValueError('dataset not supported: {}'.format(opt.dataset))
 
     return opt
 
+def _strip_module_prefix(state_dict):
+    new_state = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state[k.replace('module.', '', 1)] = v
+        else:
+            new_state[k] = v
+    return new_state
+
+def _find_latest_checkpoint(save_root, model_name):
+    pattern = os.path.join(save_root, f"{model_name}_*.pth")
+    cks = glob.glob(pattern)
+    if not cks:
+        return None
+    cks.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return cks[0]
 
 def set_model(opt):
     model = SupConResNet(name=opt.model)
@@ -107,7 +143,7 @@ def set_model(opt):
     classifier = LinearClassifier(name=opt.model, num_classes=opt.n_cls)
 
     ckpt = torch.load(opt.ckpt, map_location='cpu')
-    state_dict = ckpt['model']
+    state_dict = _strip_module_prefix(ckpt['model'])
 
     if torch.cuda.is_available():
         if torch.cuda.device_count() > 1:
@@ -159,7 +195,7 @@ def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
 
         # update metric
         losses.update(loss.item(), bsz)
-        acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+        acc1, = accuracy(output, labels, topk=(1,))
         top1.update(acc1[0], bsz)
 
         # SGD
@@ -207,7 +243,7 @@ def validate(val_loader, model, classifier, criterion, opt):
 
             # update metric
             losses.update(loss.item(), bsz)
-            acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+            acc1, = accuracy(output, labels, topk=(1,))
             top1.update(acc1[0], bsz)
 
             # measure elapsed time
@@ -230,6 +266,10 @@ def main():
     best_acc = 0
     opt = parse_option()
 
+    today = datetime.datetime.today().strftime('%Y-%m-%d')
+    save_root = f'/ssd/hbmun/supcon/models/{opt.dataset}_models/{today}'
+    os.makedirs(save_root, exist_ok=True)
+
     # build data loader
     train_loader, val_loader = set_loader(opt)
 
@@ -239,22 +279,81 @@ def main():
     # build optimizer
     optimizer = set_optimizer(opt, classifier)
 
+    start_epoch = 1
+    resume_path = None
+    if opt.resume:
+        if opt.resume == 'auto':
+            resume_path = _find_latest_checkpoint(save_root, opt.model_name)
+            ...
+        else:
+            resume_path = opt.resume if os.path.isfile(opt.resume) else None
+
+    # Resume checkpoint
+    if opt.resume:
+        print(f"Resuming from checkpoint: {opt.resume}")
+        checkpoint = torch.load(opt.resume, map_location='cuda')
+        model.load_state_dict(checkpoint['model'])
+        classifier.load_state_dict(checkpoint['classifier'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        best_acc = checkpoint.get('best_acc', 0)
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        print(f"Resumed from epoch {start_epoch-1} with best_acc {best_acc:.2f}")
+
+    # wandb
+    if opt.wandb_resume:
+        wandb.init(project="SupCon", name="etri_resnet50_001",
+                   config=vars(opt), resume="allow", id=f"{opt.model_name}")
+    else:
+        wandb.init(project="SupCon", name=f"{opt.model_name}", config=vars(opt))
+
     # training routine
-    for epoch in range(1, opt.epochs + 1):
+    for epoch in range(start_epoch, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
-        loss, acc = train(train_loader, model, classifier, criterion,
+        train_loss, train_acc = train(train_loader, model, classifier, criterion,
                           optimizer, epoch, opt)
         time2 = time.time()
         print('Train epoch {}, total time {:.2f}, accuracy:{:.2f}'.format(
-            epoch, time2 - time1, acc))
+            epoch, time2 - time1, train_acc))
 
         # eval for one epoch
-        loss, val_acc = validate(val_loader, model, classifier, criterion, opt)
+        val_loss, val_acc = validate(val_loader, model, classifier, criterion, opt)
+
+        # wandb 로그 기록
+        wandb.log({
+            "epoch": epoch,
+            "train/loss": train_loss,
+            "train/acc": train_acc,
+            "val/loss": val_loss,
+            "val/acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+
         if val_acc > best_acc:
             best_acc = val_acc
+            best_path = os.path.join(save_root, f"{opt.model_name}_best.pth")
+            state = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'classifier': classifier.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_acc': best_acc,
+            }
+            torch.save(state, best_path)
+            print(f"✅ Best model saved to: {best_path}")
+
+    last_path = os.path.join(save_root, f"{opt.model_name}_last.pth")
+    state = {
+        'epoch': opt.epochs,
+        'model': model.state_dict(),
+        'classifier': classifier.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'best_acc': best_acc,
+    }
+    torch.save(state, last_path)
+    print(f"📦 Last model saved to: {last_path}")
 
     print('best accuracy: {:.2f}'.format(best_acc))
 

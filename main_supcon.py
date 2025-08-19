@@ -8,8 +8,12 @@ import math
 
 import wandb
 import torch
+import numpy as np
 import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
+
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
@@ -31,11 +35,13 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
-    parser.add_argument('--batch_size', type=int, default=256,
+    parser.add_argument('--batch_size', type=int, default=512,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=4,
                         help='num of workers to use')
-    parser.add_argument('--epochs', type=int, default=1000,
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='number of training epochs')
+    parser.add_argument('--tsne_count', type=int, default=1,
                         help='number of training epochs')
 
     # optimization
@@ -64,7 +70,7 @@ def parse_option():
                         choices=['SupCon', 'SimCLR'], help='choose method')
 
     # temperature
-    parser.add_argument('--temp', type=float, default=0.07,
+    parser.add_argument('--temp', type=float, default=0.1,
                         help='temperature for loss function')
 
     # other setting
@@ -88,8 +94,7 @@ def parse_option():
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
-    opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
-    opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
+    opt.model_path = '/ssd/hbmun/supcon/models/{}_models'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
@@ -116,10 +121,6 @@ def parse_option():
                     1 + math.cos(math.pi * opt.warm_epochs / opt.epochs)) / 2
         else:
             opt.warmup_to = opt.learning_rate
-
-    opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
-    if not os.path.isdir(opt.tb_folder):
-        os.makedirs(opt.tb_folder)
 
     opt.save_folder = os.path.join(opt.model_path, opt.model_name)
     if not os.path.isdir(opt.save_folder):
@@ -173,7 +174,7 @@ def set_loader(opt):
         train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
         num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
 
-    return train_loader
+    return train_loader, train_dataset.class_to_idx
 
 
 def set_model(opt):
@@ -194,13 +195,16 @@ def set_model(opt):
     return model, criterion
 
 
-def train(train_loader, model, criterion, optimizer, epoch, opt):
+def train(train_loader, model, criterion, optimizer, epoch, opt, idx_to_class):
     """one epoch training"""
     model.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+
+    all_features = []
+    all_labels = []
 
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
@@ -227,6 +231,13 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
             raise ValueError('contrastive method not supported: {}'.
                              format(opt.method))
 
+        # store features for t-SNE
+        if epoch % opt.tsne_count == 0 or epoch == opt.epochs:
+            with torch.no_grad():
+                emb = features.mean(dim=1).detach().cpu()
+                all_features.append(emb)
+                all_labels.append(labels.cpu())
+
         # update metric
         losses.update(loss.item(), bsz)
 
@@ -249,6 +260,43 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
                    data_time=data_time, loss=losses))
             sys.stdout.flush()
 
+    if epoch % opt.tsne_count == 0 or epoch == opt.epochs:
+        features_np = torch.cat(all_features, dim=0).numpy()
+        labels_np = torch.cat(all_labels, dim=0).numpy()
+
+        sampled_features = []
+        sampled_labels = []
+
+        samples_per_class = 10000
+        unique_classes = np.unique(labels_np)
+
+        for class_id in unique_classes:
+            indices = np.where(labels_np == class_id)[0]
+            sample_size = min(samples_per_class, len(indices))
+            sampled_indices = np.random.choice(indices, size=sample_size, replace=False)
+
+            sampled_features.append(features_np[sampled_indices])
+            sampled_labels.append(labels_np[sampled_indices])
+
+        sampled_features = np.concatenate(sampled_features, axis=0)
+        sampled_labels = np.concatenate(sampled_labels, axis=0)
+
+        tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+        tsne_result = tsne.fit_transform(sampled_features)
+
+        plt.figure(figsize=(8, 8))
+        for class_id in np.unique(sampled_labels):
+            idxs = sampled_labels == class_id
+            class_name = idx_to_class[int(class_id)]
+            plt.scatter(tsne_result[idxs, 0], tsne_result[idxs, 1], s=5, label=class_name, alpha=0.6)
+
+        plt.legend()
+        plt.title(f't-SNE at epoch {epoch} (up to 10K per class)')
+        plt.grid(True)
+
+        wandb.log({"tsne_plot": wandb.Image(plt)}, step=epoch)
+        plt.close()
+
     return losses.avg
 
 
@@ -256,7 +304,8 @@ def main():
     opt = parse_option()
 
     # build data loader
-    train_loader = set_loader(opt)
+    train_loader, class_to_idx = set_loader(opt)
+    idx_to_class = {v: k for k, v in class_to_idx.items()}
 
     # build model and criterion
     model, criterion = set_model(opt)
@@ -265,7 +314,13 @@ def main():
     optimizer = set_optimizer(opt, model)
 
     # wandb
-    wandb.init(project="SupCon", name=opt.model_name, config=vars(opt))
+    wandb.init(
+        project="SupCon",
+        name=f"{opt.model_name}",
+        notes="Supervised Contrastive Learning with ResNet50 and CIFAR10",
+        tags=["SupCon", "CIFAR10", "resnet50"],
+        config=vars(opt)
+    )
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
@@ -273,7 +328,7 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss = train(train_loader, model, criterion, optimizer, epoch, opt)
+        loss = train(train_loader, model, criterion, optimizer, epoch, opt, idx_to_class)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
