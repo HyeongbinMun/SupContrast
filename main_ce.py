@@ -6,6 +6,7 @@ import argparse
 import time
 import math
 import torch
+import wandb
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
@@ -31,7 +32,7 @@ def parse_option():
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=4,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=500,
                         help='number of training epochs')
@@ -51,7 +52,15 @@ def parse_option():
     # model dataset
     parser.add_argument('--model', type=str, default='resnet50')
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100'], help='dataset')
+                        choices=['cifar10', 'cifar100', 'path'], help='dataset')
+    parser.add_argument('--data_path', type=str, default='',
+                        help='path to custom dataset when dataset is "path"')
+    parser.add_argument('--img_size', type=int, default=224,
+                        help='input image size for custom dataset or cifar upscaling')
+    parser.add_argument('--mean', nargs=3, type=float, default=[0.485, 0.456, 0.406],
+                        help='mean for normalization when dataset is "path"')
+    parser.add_argument('--std',  nargs=3, type=float, default=[0.229, 0.224, 0.225],
+                        help='std for normalization when dataset is "path"')
 
     # other setting
     parser.add_argument('--cosine', action='store_true',
@@ -66,9 +75,9 @@ def parse_option():
     opt = parser.parse_args()
 
     # set the path according to the environment
-    opt.data_folder = './datasets/'
-    opt.model_path = './save/SupCon/{}_models'.format(opt.dataset)
-    opt.tb_path = './save/SupCon/{}_tensorboard'.format(opt.dataset)
+    opt.data_folder = '/ssd/hbmun/supcon/'
+    opt.model_path = '/ssd/hbmun/supcon/models/path_models/{}_models'.format(opt.dataset)
+    opt.tb_path = '/ssd/hbmun/supcon/models/path_models/{}_tensorboard'.format(opt.dataset)
 
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
@@ -108,8 +117,19 @@ def parse_option():
         opt.n_cls = 10
     elif opt.dataset == 'cifar100':
         opt.n_cls = 100
+    elif opt.dataset == 'path':
+        if not opt.data_path:
+            raise ValueError('When dataset is "path", you must set --data_path to your dataset root.')
+        if not os.path.isdir(opt.data_path):
+            raise ValueError(f'Invalid --data_path: {opt.data_path}')
+        tr_dir = os.path.join(opt.data_path, 'train')
+        va_dir = os.path.join(opt.data_path, 'val')
+        if not (os.path.isdir(tr_dir) and os.path.isdir(va_dir)):
+            raise ValueError(f'Expected subfolders "train" and "val" inside {opt.data_path}')
+        opt.data_folder = opt.data_path
+        opt.n_cls = None
     else:
-        raise ValueError('dataset not supported: {}'.format(opt.dataset))
+        raise ValueError(f'dataset not supported: {opt.dataset}')
 
     return opt
 
@@ -256,7 +276,10 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
         # update metric
         losses.update(loss.item(), bsz)
-        acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+        num_classes = output.size(1)
+        k_list = (1, 5) if num_classes >= 5 else (1,)
+        accs = accuracy(output, labels, topk=k_list)
+        acc1 = accs[0]
         top1.update(acc1[0], bsz)
 
         # SGD
@@ -303,7 +326,10 @@ def validate(val_loader, model, criterion, opt):
 
             # update metric
             losses.update(loss.item(), bsz)
-            acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+            num_classes = output.size(1)
+            k_list = (1, 5) if num_classes >= 5 else (1,)
+            accs = accuracy(output, labels, topk=k_list)
+            acc1 = accs[0]
             top1.update(acc1[0], bsz)
 
             # measure elapsed time
@@ -335,18 +361,36 @@ def main():
     # build optimizer
     optimizer = set_optimizer(opt, model)
 
+    # wandb init
+    wandb.init(
+        project="SupCon",
+        name=f"{opt.model_name}",
+        notes="CrossEntropy Training with ResNet and Adult",
+        tags=["SupCon", opt.dataset, opt.model],
+        config=vars(opt)
+    )
+
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
-        loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, opt)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, opt)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
         # evaluation
-        loss, val_acc = validate(val_loader, model, criterion, opt)
+        val_loss, val_acc = validate(val_loader, model, criterion, opt)
+
+        wandb.log({
+            'epoch': epoch,
+            'train/loss': train_loss,
+            'train/acc': train_acc,
+            'val/loss': val_loss,
+            'val/acc': val_acc,
+            'lr': optimizer.param_groups[0]['lr'],
+        })
 
         if val_acc > best_acc:
             best_acc = val_acc
